@@ -32,7 +32,7 @@ from __future__ import annotations
 import random
 from typing import Any
 
-from gameday_lab.breaker import BreakerState, Permit, SlidingWindowBreaker  # noqa: F401
+from gameday_lab.breaker import BreakerState, Permit, SlidingWindowBreaker
 from gameday_lab.errors import ErrorKind, classify, counts_toward_breaker  # noqa: F401
 from gameday_lab.retry import FullJitterBackoff, RetryBudget
 from gameday_lab.sim.contracts import (
@@ -47,6 +47,7 @@ from gameday_lab.sim.contracts import (
 )
 
 RATE_LIMIT_WAIT_MAX_S = 5.0  # only wait for short (rate-limit) cooldowns, never for quota
+MAX_RATE_LIMIT_WAITS = 3  # per logical call
 
 
 class ResilientClient(BaseClient):
@@ -99,37 +100,96 @@ class ResilientClient(BaseClient):
 
     # ------------------------------------------------------------------ TODO
     def ladder(self, task: str) -> list[str]:
-        """TODO(student): ``self.order`` filtered by capability —
-        a "tool" call may only use providers with ``supports_tools``."""
-        raise NotImplementedError("TODO(student): ladder()")
+        """``self.order`` filtered by capability: a "tool" call only uses providers with tool calling."""
+        if task == "tool":
+            return [p for p in self.order if self.providers[p].supports_tools]
+        return list(self.order)
+
+    def _route_order(self, task: str) -> list[str]:
+        """Order in which a call walks the ladder.
+
+        Plain chat does not need tool calling, so once the primary model family is unusable it prefers
+        the cheap non-tool deployments over the *other* tool-capable ones. That keeps the scarce
+        tool-capable fallback capacity (and its rate limit) free for the calls that cannot go anywhere else.
+        """
+        lad = self.ladder(task)
+        if task == "tool" or not lad:
+            return lad
+        primary_family = self.providers[lad[0]].family
+        head = [p for p in lad if self.providers[p].family == primary_family]
+        no_tools = [p for p in lad if p not in head and not self.providers[p].supports_tools]
+        rest = [p for p in lad if p not in head and p not in no_tools]
+        return head + no_tools + rest
 
     def _route(self, call: CallContext, now: float, delay: float = 0.0) -> Action:
-        """TODO(student): pick the provider for the next attempt.
-
-        Walk the ladder from call.state["idx"]:
-          * skip a provider still in cooldown at send time (now + delay)
-          * otherwise try self._send(...); a non-None result is your answer
-          * when skipping, move idx forward, reset tries, and set delay = 0
-            (a failover goes out immediately)
-        If the ladder is exhausted: optionally wait for the earliest *short*
-        rate-limit cooldown (<= RATE_LIMIT_WAIT_MAX_S, breaker not OPEN, fits the
-        deadline), else GiveUp("no_provider_available").
-        """
-        raise NotImplementedError("TODO(student): _route()")
+        """Pick the provider for the next attempt (see module docstring)."""
+        st = call.state
+        lad: list[str] = st["ladder"]
+        while st["idx"] < len(lad):
+            provider = lad[st["idx"]]
+            if self.cooldown_until[provider] <= now + delay:
+                action = self._send(call, provider, now, delay)
+                if action is not None:
+                    if isinstance(action, Send):
+                        st["tries"] += 1
+                    return action
+            st["idx"] += 1
+            st["tries"] = 0
+            delay = 0.0
+        # Ladder exhausted: maybe wait for a short rate-limit cooldown (bounded number of waits per call).
+        if st.get("waits", 0) < MAX_RATE_LIMIT_WAITS:
+            waits = [
+                self.cooldown_until[p] - now
+                for p in lad
+                if 0.0 < self.cooldown_until[p] - now <= RATE_LIMIT_WAIT_MAX_S
+                and self.breakers[p].state is not BreakerState.OPEN
+                and now + (self.cooldown_until[p] - now) + self.min_time_left_s <= call.deadline
+            ]
+            if waits:
+                st["waits"] = st.get("waits", 0) + 1
+                st["idx"] = 0
+                st["tries"] = 0
+                # jitter so that every waiter does not come back in the same instant
+                return self._route(call, now, min(waits) + self.backoff.rng.uniform(0, 1.0))
+        return GiveUp("no_provider_available")
 
     def start(self, call: CallContext, now: float) -> Action:
-        """TODO(student): record the request in the retry budget, initialise
-        call.state (ladder, idx=0, tries=0) and route."""
-        raise NotImplementedError("TODO(student): start()")
+        self.budget.record_request(now)
+        call.state.update(ladder=self._route_order(call.task), idx=0, tries=0)
+        return self._route(call, now)
 
     def on_success(self, attempt: Attempt, now: float, latency_s: float) -> None:
-        """TODO(student): report success + latency to the provider's breaker (attempt.tag is the Permit)."""
-        raise NotImplementedError("TODO(student): on_success()")
+        self.breakers[attempt.provider].on_success(attempt.tag, now, latency_s)
 
     def on_error(self, attempt: Attempt, err: ProviderError, now: float) -> Action:
-        """TODO(student): implement the decision table in the module docstring."""
-        raise NotImplementedError("TODO(student): on_error()")
+        call = attempt.call
+        st = call.state
+        provider = attempt.provider
+        breaker = self.breakers[provider]
+        kind = classify(err)
+
+        if kind is ErrorKind.CLIENT_ERROR:
+            breaker.release(attempt.tag, now)
+            return GiveUp("client_error")
+
+        if kind is ErrorKind.QUOTA_EXHAUSTED or kind is ErrorKind.RATE_LIMITED:
+            breaker.release(attempt.tag, now)
+            cool = self.quota_cooldown_s if kind is ErrorKind.QUOTA_EXHAUSTED else (err.retry_after or 1.0)
+            self.cooldown_until[provider] = max(self.cooldown_until[provider], now + cool)
+            return self._failover(call, now)
+
+        # Provider health problem: overloaded / server error / timeout.
+        breaker.on_failure(attempt.tag, now)
+        if st["tries"] < self.max_attempts_per_provider and self.budget.try_acquire_retry(now):
+            delay = self.backoff.delay(st["tries"], err.retry_after)
+            return self._route(call, now, delay)
+        return self._failover(call, now)
+
+    def _failover(self, call: CallContext, now: float) -> Action:
+        call.state["idx"] += 1
+        call.state["tries"] = 0
+        return self._route(call, now)
 
     def on_cancel(self, call: CallContext, tag: Any, now: float) -> None:
-        """TODO(student): a delayed attempt was dropped (deadline) — release its permit."""
-        raise NotImplementedError("TODO(student): on_cancel()")
+        if isinstance(tag, Permit):
+            self.breakers[tag.breaker].release(tag, now)
